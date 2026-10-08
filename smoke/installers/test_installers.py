@@ -1421,6 +1421,199 @@ def test_install_sh_preserves_unrelated_macos_desktop_link(
     assert desktop_link.readlink() == unrelated
 
 
+def _run_bundle_builder(
+    *args: str, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["/bin/sh", str(_repo_root() / "scripts" / "build_macos_app.sh"), *args],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env if env is not None else {"PATH": "/usr/bin:/bin"},
+    )
+
+
+def _bundle_files(app: Path) -> dict[str, tuple[bytes, int]]:
+    files: dict[str, tuple[bytes, int]] = {}
+    for path in sorted(app.rglob("*")):
+        if path.is_dir():
+            continue
+        relative = path.relative_to(app).as_posix()
+        files[relative] = (path.read_bytes(), path.stat().st_mode & 0o777)
+    return files
+
+
+def test_build_macos_app_matches_installed_macos_bundle(
+    posix_harness: PosixHarness,
+) -> None:
+    posix_harness.env["FAKE_UNAME"] = "Darwin"
+    tool_bin = posix_harness.root / "tool's bin"
+    posix_harness.env["FAKE_TOOL_BIN"] = str(tool_bin)
+    installed = posix_harness.run()
+    assert installed.returncode == 0, installed.stderr
+    installed_app = (
+        posix_harness.root / "home" / "Applications" / "Free Claude Code.app"
+    )
+
+    built_root = posix_harness.root / "built"
+    built_root.mkdir()
+    built = _run_bundle_builder(
+        "--dest",
+        str(built_root),
+        "--fcc-desktop",
+        str(tool_bin / "fcc-desktop"),
+        "--icon",
+        str(installed_app / "Contents" / "Resources" / "AppIcon.icns"),
+    )
+
+    assert built.returncode == 0, built.stderr
+    assert _bundle_files(built_root / "Free Claude Code.app") == _bundle_files(
+        installed_app
+    )
+
+
+def test_build_macos_app_copies_packaged_icon(tmp_path: Path) -> None:
+    result = _run_bundle_builder("--dest", str(tmp_path))
+
+    assert result.returncode == 0, result.stderr
+    contents = tmp_path / "Free Claude Code.app" / "Contents"
+    packaged_icon = (
+        _repo_root() / "src" / "free_claude_code" / "assets" / "app-icon.icns"
+    )
+    assert (contents / "Resources" / "AppIcon.icns").read_bytes() == (
+        packaged_icon.read_bytes()
+    )
+    assert contents.joinpath(".free-claude-code-owner").read_text(
+        encoding="utf-8"
+    ).strip() == ("io.github.alishahryar1.free-claude-code")
+    plist_text = (contents / "Info.plist").read_text(encoding="utf-8")
+    assert "<key>CFBundleIconFile</key>" in plist_text
+    assert "<string>AppIcon</string>" in plist_text
+    assert "<key>CFBundleExecutable</key>" in plist_text
+    assert "<string>fcc-desktop</string>" in plist_text
+    assert "<key>LSUIElement</key>" in plist_text
+    assert "<key>LSMultipleInstancesProhibited</key>" in plist_text
+    assert (contents / "MacOS" / "fcc-desktop").stat().st_mode & 0o111
+
+
+def test_build_macos_app_launcher_runs_discovered_desktop_command(
+    tmp_path: Path,
+) -> None:
+    _run_bundle_builder("--dest", str(tmp_path))
+    launcher = tmp_path / "Free Claude Code.app" / "Contents" / "MacOS" / "fcc-desktop"
+    home = tmp_path / "home"
+    marker = tmp_path / "ran.log"
+    _write_executable(
+        home / ".local" / "bin" / "fcc-desktop",
+        """#!/bin/sh
+printf 'desktop-ran\\n' >> "$FCC_TEST_MARKER"
+exit 7
+""",
+    )
+
+    launched = subprocess.run(
+        ["/bin/sh", str(launcher)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(home),
+            "FCC_TEST_MARKER": str(marker),
+        },
+    )
+
+    assert launched.returncode == 7, launched.stderr
+    assert marker.read_text(encoding="utf-8") == "desktop-ran\n"
+
+
+def test_build_macos_app_launcher_prefers_uv_tool_bin_directory(
+    tmp_path: Path,
+) -> None:
+    _run_bundle_builder("--dest", str(tmp_path))
+    launcher = tmp_path / "Free Claude Code.app" / "Contents" / "MacOS" / "fcc-desktop"
+    home = tmp_path / "home"
+    marker = tmp_path / "ran.log"
+    for directory in (home / ".local" / "bin", tmp_path / "uv-bin"):
+        _write_executable(
+            directory / "fcc-desktop",
+            """#!/bin/sh
+printf '%s\\n' "$0" >> "$FCC_TEST_MARKER"
+""",
+        )
+
+    subprocess.run(
+        ["/bin/sh", str(launcher)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(home),
+            "UV_TOOL_BIN_DIR": str(tmp_path / "uv-bin"),
+            "FCC_TEST_MARKER": str(marker),
+        },
+    )
+
+    assert marker.read_text(encoding="utf-8") == (
+        f"{tmp_path / 'uv-bin' / 'fcc-desktop'}\n"
+    )
+
+
+def test_build_macos_app_launcher_reports_missing_desktop_command(
+    tmp_path: Path,
+) -> None:
+    _run_bundle_builder("--dest", str(tmp_path))
+    launcher = tmp_path / "Free Claude Code.app" / "Contents" / "MacOS" / "fcc-desktop"
+    home = tmp_path / "empty-home"
+    home.mkdir()
+
+    result = subprocess.run(
+        ["/bin/sh", str(launcher)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(home)},
+    )
+
+    assert result.returncode == 1
+    assert "could not find the fcc-desktop command" in result.stderr
+    log = home / "Library" / "Logs" / "free-claude-code-desktop.log"
+    assert "could not find the fcc-desktop command" in log.read_text(encoding="utf-8")
+
+
+def test_build_macos_app_dry_run_writes_nothing(tmp_path: Path) -> None:
+    result = _run_bundle_builder("--dest", str(tmp_path), "--dry-run")
+
+    assert result.returncode == 0, result.stderr
+    assert "Dry run complete. No changes were made." in result.stdout
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_build_macos_app_rejects_unowned_bundle(tmp_path: Path) -> None:
+    contents = tmp_path / "Free Claude Code.app" / "Contents"
+    contents.mkdir(parents=True)
+    plist = contents / "Info.plist"
+    plist.write_text("foreign app", encoding="utf-8")
+
+    result = _run_bundle_builder("--dest", str(tmp_path))
+
+    assert result.returncode != 0
+    assert "not managed by Free Claude Code" in result.stderr
+    assert plist.read_text(encoding="utf-8") == "foreign app"
+    assert not (contents / ".free-claude-code-owner").exists()
+
+
+def test_build_macos_app_rejects_missing_icon(tmp_path: Path) -> None:
+    missing_icon = tmp_path / "missing.icns"
+
+    result = _run_bundle_builder("--dest", str(tmp_path), "--icon", str(missing_icon))
+
+    assert result.returncode != 0
+    assert f"No icon file exists at {missing_icon}." in result.stderr
+    assert list(tmp_path.iterdir()) == []
+
+
 @pytest.mark.parametrize("uv_version", ("0.12.13", "0.12.13+build.1", "0.12.14"))
 def test_install_sh_preserves_valid_existing_tools(
     posix_harness: PosixHarness,
